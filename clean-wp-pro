@@ -1,0 +1,320 @@
+<?php
+/*
+Plugin Name: WP Script Cleaner Pro
+Description: Nettoie contenus inutiles + supprime doublons média + synchro FTP/media par dossiers & batch (anti-timeout)
+Version: 2.4
+Author: Ayden Dev
+*/
+
+if (!defined('ABSPATH')) exit;
+
+// Session pour batch (anti-timeout)
+add_action('init', function() {
+    if (!session_id()) session_start();
+});
+
+// Ajouter le menu dans l’admin WordPress
+add_action('admin_menu', 'wpscript_cleaner_menu');
+function wpscript_cleaner_menu() {
+    add_menu_page(
+        'WP Script Cleaner Pro',
+        'WP Script Cleaner Pro',
+        'manage_options',
+        'wpscript-cleaner-pro',
+        'wpscript_cleaner_page',
+        'dashicons-buddicons-replies',
+        61
+    );
+}
+
+// Lister récursivement tous les sous-dossiers dans uploads
+function wpscript_list_uploads_folders($dir) {
+    $folders = [];
+    $rii = new RecursiveIteratorIterator(new RecursiveDirectoryIterator($dir, RecursiveDirectoryIterator::SKIP_DOTS), RecursiveIteratorIterator::SELF_FIRST);
+    foreach ($rii as $file) {
+        if ($file->isDir()) $folders[] = $file->getPathname();
+    }
+    return $folders;
+}
+
+// Synchroniser UNIQUEMENT les dossiers sélectionnés par batch (anti-timeout)
+function wpscript_sync_selected_folders_to_media_batch($selected, $batch = 50) {
+    $upload_dir = wp_get_upload_dir();
+    $base_dir = $upload_dir['basedir'];
+    $base_url = $upload_dir['baseurl'];
+    $allowed_ext = ['jpg','jpeg','png','gif','webp','mp4','mov','avi','mkv'];
+    $imported = 0;
+
+    // Liste des fichiers à importer stockée en SESSION
+    if (!isset($_SESSION['wpscript_files']) || isset($_POST['reset_sync'])) {
+        $existing_files = [];
+        $attachments = get_posts(['post_type'=>'attachment','numberposts'=>-1,'post_status'=>'inherit']);
+        foreach ($attachments as $att) {
+            $existing_files[] = basename(get_attached_file($att->ID));
+        }
+        $to_import = [];
+        foreach ($selected as $rel_folder) {
+            $abs_folder = trailingslashit($base_dir) . $rel_folder;
+            if (!is_dir($abs_folder)) continue;
+            $rii = new RecursiveIteratorIterator(new RecursiveDirectoryIterator($abs_folder, RecursiveDirectoryIterator::SKIP_DOTS));
+            foreach ($rii as $file) {
+                if ($file->isDir()) continue;
+                $filename = $file->getFilename();
+                $ext = strtolower(pathinfo($filename, PATHINFO_EXTENSION));
+                if (!in_array($ext, $allowed_ext)) continue;
+                if (in_array($filename, $existing_files)) continue;
+                $to_import[] = $file->getPathname();
+            }
+        }
+        $_SESSION['wpscript_files'] = $to_import;
+    }
+
+    $files = &$_SESSION['wpscript_files'];
+    $total = count($files) + $imported;
+    $done = 0;
+
+    while ($imported < $batch && !empty($files)) {
+        $file_path = array_shift($files);
+        $filename = basename($file_path);
+        $filetype = wp_check_filetype($filename, null);
+        $attachment = [
+            'guid' => $base_url . '/' . ltrim(str_replace(trailingslashit($base_dir), '', $file_path), '/\\'),
+            'post_mime_type' => $filetype['type'],
+            'post_title' => preg_replace('/\.[^.]+$/', '', $filename),
+            'post_content' => '',
+            'post_status' => 'inherit'
+        ];
+        $attach_id = wp_insert_attachment($attachment, $file_path);
+        require_once(ABSPATH . 'wp-admin/includes/image.php');
+        $attach_data = wp_generate_attachment_metadata($attach_id, $file_path);
+        wp_update_attachment_metadata($attach_id, $attach_data);
+        $imported++; $done++;
+    }
+    return ['imported' => $done, 'remaining' => count($files), 'total' => $done + count($files)];
+}
+
+// PAGE ADMIN
+function wpscript_cleaner_page() {
+    $upload_dir = wp_get_upload_dir();
+    $base_dir = $upload_dir['basedir'];
+    $folders = wpscript_list_uploads_folders($base_dir);
+
+    echo '<div class="wrap"><h1><span class="dashicons dashicons-buddicons-replies" style="font-size:28px;color:#c0392b;"></span> WP Script Cleaner Pro</h1>';
+    echo '<form method="post">';
+    echo '<p><input type="submit" name="clean_all" class="button button-primary" value="🧹 Nettoyage Complet"></p>';
+    echo '<p>
+        <input type="submit" name="clean_duplicates" class="button" value="♻️ Supprimer les doublons (titre + image)">
+        <input type="submit" name="clean_without_fr" class="button" value="🇫🇷 Supprimer vidéos sans mot-clé français">
+        <input type="submit" name="clean_no_thumbnail" class="button" value="🖼 Supprimer vidéos sans image à la une">
+        <input type="submit" name="clean_old_posts" class="button" value="📆 Supprimer vidéos anciennes (1 an +)">
+    </p>';
+    echo '<p>
+        <input type="submit" name="keep_only_legal_pages" class="button" value="⚖️ Garder uniquement 2257 / DMCA / Privacy Policy">
+    </p>';
+    echo '<hr />';
+    echo '<p>
+        <input type="submit" name="media_clean_duplicates" class="button" value="🗑 Supprimer images/vidéos doublons">
+    </p>';
+    echo '<hr /><b>Synchroniser les fichiers FTP d\'un ou plusieurs dossiers (batchs 50 fichiers) :</b><br>';
+    echo '<div style="max-height:200px;overflow:auto;border:1px solid #ccc;padding:8px;margin-bottom:10px">';
+    foreach ($folders as $f) {
+        $rel = ltrim(str_replace($base_dir, '', $f), '/\\');
+        echo '<label style="display:block"><input type="checkbox" name="sync_folders[]" value="' . esc_attr($rel) . '"';
+        if (isset($_POST['sync_folders']) && in_array($rel, $_POST['sync_folders'])) echo ' checked';
+        echo '> ' . esc_html($rel) . '</label>';
+    }
+    echo '</div>';
+    echo '<input type="submit" name="media_sync_ftp" class="button" value="🔄 Démarrer la synchronisation">';
+    if (isset($_SESSION['wpscript_files']) && count($_SESSION['wpscript_files']) > 0) {
+        echo ' <input type="submit" name="media_sync_ftp" class="button button-primary" value="Continuer la synchronisation">';
+        echo ' <input type="submit" name="reset_sync" class="button" value="❌ Annuler/Reset">';
+    }
+    echo '</form></div>';
+
+    // Traitement des boutons (en POST)
+    if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+        if (isset($_POST['clean_all'])) {
+            $p = wpscript_delete_empty_pages();
+            $c = wpscript_delete_empty_categories();
+            $t = wpscript_delete_empty_tags();
+            echo '<div class="notice notice-success"><p>✅ Tout nettoyé : ' . $p . ' pages, ' . $c . ' catégories, ' . $t . ' tags supprimés.</p></div>';
+        }
+        if (isset($_POST['clean_duplicates'])) {
+            $deleted = wpscript_delete_duplicate_posts();
+            echo '<div class="notice notice-success"><p>♻️ Doublons supprimés : ' . $deleted . '</p></div>';
+        }
+        if (isset($_POST['clean_without_fr'])) {
+            $deleted = wpscript_delete_posts_without_fr_keywords();
+            echo '<div class="notice notice-success"><p>🇫🇷 Vidéos non FR supprimées : ' . $deleted . '</p></div>';
+        }
+        if (isset($_POST['clean_no_thumbnail'])) {
+            $deleted = wpscript_delete_posts_without_thumbnail();
+            echo '<div class="notice notice-success"><p>🖼 Vidéos sans image supprimées : ' . $deleted . '</p></div>';
+        }
+        if (isset($_POST['clean_old_posts'])) {
+            $deleted = wpscript_delete_old_posts();
+            echo '<div class="notice notice-success"><p>📆 Vidéos anciennes supprimées : ' . $deleted . '</p></div>';
+        }
+        if (isset($_POST['keep_only_legal_pages'])) {
+            $deleted = wpscript_delete_all_pages_except_legal();
+            echo '<div class="notice notice-success"><p>⚖️ Pages supprimées (hors mentions légales) : ' . $deleted . '</p></div>';
+        }
+        if (isset($_POST['media_clean_duplicates'])) {
+            $deleted = wpscript_delete_media_duplicates();
+            echo '<div class="notice notice-success"><p>🗑 Médias doublons supprimés : ' . $deleted . '</p></div>';
+        }
+        if (isset($_POST['media_sync_ftp'])) {
+            $selected = isset($_POST['sync_folders']) && is_array($_POST['sync_folders']) ? $_POST['sync_folders'] : [];
+            if (empty($selected) && !isset($_SESSION['wpscript_files'])) {
+                echo '<div class="notice notice-error"><p>Merci de sélectionner au moins un dossier à synchroniser.</p></div>';
+            } else {
+                $batch_size = 50;
+                $result = wpscript_sync_selected_folders_to_media_batch($selected, $batch_size);
+                echo '<div class="notice notice-success"><p>🔄 Fichiers synchronisés/importés ce tour : ' . $result['imported'] . '<br>
+                Reste à synchroniser : ' . $result['remaining'] . ' sur ' . $result['total'] . '</p></div>';
+                if ($result['remaining'] == 0) {
+                    unset($_SESSION['wpscript_files']);
+                    echo '<div class="notice notice-success"><p>✅ Synchronisation terminée !</p></div>';
+                }
+            }
+        }
+        if (isset($_POST['reset_sync'])) {
+            unset($_SESSION['wpscript_files']);
+            echo '<div class="notice notice-success"><p>❌ Synchronisation annulée.</p></div>';
+        }
+    }
+}
+
+// Fonctions classiques de nettoyage (inchangées)
+function wpscript_delete_empty_pages() {
+    $count = 0;
+    $pages = get_posts(['post_type' => 'page', 'post_status' => 'publish', 'numberposts' => -1]);
+    foreach ($pages as $page) {
+        if (strlen(strip_tags($page->post_content)) < 30) {
+            wp_delete_post($page->ID, true);
+            $count++;
+        }
+    }
+    return $count;
+}
+function wpscript_delete_empty_categories() {
+    $count = 0;
+    $cats = get_categories(['hide_empty' => false]);
+    foreach ($cats as $cat) {
+        if ($cat->count == 0) {
+            wp_delete_term($cat->term_id, 'category');
+            $count++;
+        }
+    }
+    return $count;
+}
+function wpscript_delete_empty_tags() {
+    $count = 0;
+    $tags = get_tags(['hide_empty' => false]);
+    foreach ($tags as $tag) {
+        if ($tag->count == 0) {
+            wp_delete_term($tag->term_id, 'post_tag');
+            $count++;
+        }
+    }
+    return $count;
+}
+function wpscript_delete_duplicate_posts() {
+    $deleted = 0;
+    $posts = get_posts(['post_type' => 'post', 'numberposts' => -1, 'post_status' => 'publish']);
+    $titles = [];
+    $thumbs = [];
+    foreach ($posts as $post) {
+        $title = strtolower(trim($post->post_title));
+        $thumb_id = get_post_thumbnail_id($post->ID);
+        if (in_array($title, $titles) || ($thumb_id && in_array($thumb_id, $thumbs))) {
+            wp_delete_post($post->ID, true);
+            $deleted++;
+        } else {
+            $titles[] = $title;
+            if ($thumb_id) $thumbs[] = $thumb_id;
+        }
+    }
+    return $deleted;
+}
+function wpscript_delete_posts_without_fr_keywords() {
+    $keywords = ['france', 'française', 'francais', 'libertine', 'salope', 'paris', 'français'];
+    $deleted = 0;
+    $posts = get_posts(['post_type' => 'post', 'numberposts' => -1, 'post_status' => 'publish']);
+    foreach ($posts as $post) {
+        $content = strtolower(strip_tags($post->post_content . ' ' . $post->post_title));
+        $found = false;
+        foreach ($keywords as $kw) {
+            if (strpos($content, $kw) !== false) {
+                $found = true;
+                break;
+            }
+        }
+        if (!$found) {
+            wp_delete_post($post->ID, true);
+            $deleted++;
+        }
+    }
+    return $deleted;
+}
+function wpscript_delete_posts_without_thumbnail() {
+    $deleted = 0;
+    $posts = get_posts(['post_type' => 'post', 'numberposts' => -1, 'post_status' => 'publish']);
+    foreach ($posts as $post) {
+        if (!has_post_thumbnail($post->ID)) {
+            wp_delete_post($post->ID, true);
+            $deleted++;
+        }
+    }
+    return $deleted;
+}
+function wpscript_delete_old_posts() {
+    $deleted = 0;
+    $cutoff = strtotime('-1 year');
+    $posts = get_posts(['post_type' => 'post', 'numberposts' => -1, 'post_status' => 'publish']);
+    foreach ($posts as $post) {
+        if (strtotime($post->post_date) < $cutoff) {
+            wp_delete_post($post->ID, true);
+            $deleted++;
+        }
+    }
+    return $deleted;
+}
+function wpscript_delete_all_pages_except_legal() {
+    $keep_titles = ['18 U.S.C 2257', 'DMCA', 'Privacy Policy'];
+    $deleted = 0;
+    $pages = get_posts([
+        'post_type' => 'page',
+        'post_status' => 'publish',
+        'numberposts' => -1
+    ]);
+    foreach ($pages as $page) {
+        if (!in_array(trim($page->post_title), $keep_titles)) {
+            wp_delete_post($page->ID, true);
+            $deleted++;
+        }
+    }
+    return $deleted;
+}
+function wpscript_delete_media_duplicates() {
+    $deleted = 0;
+    $hashes = [];
+    $attachments = get_posts([
+        'post_type' => 'attachment',
+        'numberposts' => -1,
+        'post_status' => 'inherit'
+    ]);
+    foreach ($attachments as $att) {
+        $filepath = get_attached_file($att->ID);
+        if (!file_exists($filepath)) continue;
+        $hash = md5_file($filepath); // Hash unique fichier
+        if (in_array($hash, $hashes)) {
+            wp_delete_attachment($att->ID, true);
+            $deleted++;
+        } else {
+            $hashes[] = $hash;
+        }
+    }
+    return $deleted;
+}
+?>
